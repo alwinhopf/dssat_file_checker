@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dssat-file-checker"
+version = "0.1.0"
+description = "Static formatting, logic validator, and web GUI auto-healer for DSSAT crop-model input files"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [{name = "DSSAT Contributors"}]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+gui = [
+  "streamlit>=1.20.0",
+  "pandas>=1.3.0",
+  "numpy>=1.20.0",
+]
+
+[project.scripts]
+dssat-check = "dssat_checker:main"
+
+[tool.setuptools]
+py-modules = ["dssat_checker", "app"]

@@ -831,6 +831,33 @@ def render_log(label: str, items: list, color: str = "info"):
             fn(msg)
 
 
+try:
+    import dssat_checker as dc
+    HAS_STATIC_CHECKER = True
+except ImportError:
+    HAS_STATIC_CHECKER = False
+
+
+def render_static_rule_findings(text: str, filename: str):
+    if not HAS_STATIC_CHECKER:
+        return
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir) / filename
+        tmp_path.write_text(text, encoding="utf-8")
+        parsed_file = dc.parse_file(tmp_path)
+        dc.validate_file(parsed_file)
+        if parsed_file.findings:
+            with st.expander(f"🔍 Static Rule Checker Findings ({len(parsed_file.findings)} items)", expanded=False):
+                for f in parsed_file.findings:
+                    sev_symbol = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}.get(f.severity.label(), "ℹ️")
+                    loc = f"Line {f.line}" + (f", Col {f.column}" if f.column else "")
+                    st.markdown(f"**{sev_symbol} [{f.code}]** `{loc}` — {f.message}")
+                    if f.suggestion:
+                        st.caption(f"💡 *Suggestion:* {f.suggestion}")
+
+
 st.title("🌾 DSSAT Master Validator")
 st.caption("Standalone validator for Weather (.WTH), Soil (.SOL), and Experiment files — no external dependencies.")
 
@@ -855,6 +882,7 @@ if uploaded_file:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     st.divider()
+    render_static_rule_findings(text, fname)
 
     # ── WEATHER ──────────────────────────────────────────────────────────────
     if ext == "wth":
