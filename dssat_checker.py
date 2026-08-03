@@ -21,11 +21,11 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MISSING = {"", "-99", "-99.0", "-99.00", "-99.000", "NA", "N/A", "NULL", "."}
 INPUT_EXTENSIONS = {".WTH", ".SOL", ".CUL", ".ECO", ".SPE"}
 EXPERIMENT_EXTENSION = re.compile(r"^\.[A-Z0-9]{2}X$", re.IGNORECASE)
-DATE_FIELD = re.compile(r"(?:^|_)(?:DATE|.*DAT|PDATE|EDATE|IDATE|FDATE|HDATE|SDATE)$", re.I)
+DATE_FIELD = re.compile(r"(?:^|_)(?:DATE|.*DAT|PDATE|EDATE|IDATE|HDATE|SDATE)$", re.I)
 
 
 class Severity(IntEnum):
@@ -102,8 +102,7 @@ def as_float(value: str | None) -> float | None:
 def dssat_date(value: str | None) -> date | None:
     """Parse DSSAT YYDDD or YYYYDDD dates.
 
-    DSSAT's two-digit year convention is interpreted as 00-49 => 2000-2049 and
-    50-99 => 1950-1999, matching Python's common %y convention.
+    The workspace convention is 00-79 => 2000-2079 and 80-99 => 1980-1999.
     """
     if is_missing(value):
         return None
@@ -113,7 +112,7 @@ def dssat_date(value: str | None) -> date | None:
     year_text, doy_text = (text[:2], text[2:]) if len(text) == 5 else (text[:4], text[4:])
     year = int(year_text)
     if len(text) == 5:
-        year += 2000 if year <= 49 else 1900
+        year += 2000 if year < 80 else 1900
     doy = int(doy_text)
     max_doy = 366 if _is_leap(year) else 365
     if not 1 <= doy <= max_doy:
@@ -172,7 +171,11 @@ def read_text(path: Path) -> tuple[list[str], list[Finding]]:
             findings.append(Finding(Severity.ERROR, "FMT005", display, number, "Tab character found in a fixed-width DSSAT file.", "Replace tabs with spaces; tab width is parser-dependent.", line.index("\t") + 1))
         if len(line) > 240:
             findings.append(Finding(Severity.WARNING, "FMT006", display, number, f"Line is unusually long ({len(line)} characters).", "Verify that records were not accidentally concatenated."))
-        controls = [i for i, ch in enumerate(line) if ord(ch) < 32 and ch not in "\r\n\t"]
+        controls = [
+            i for i, ch in enumerate(line)
+            if ord(ch) < 32 and ch not in "\r\n\t"
+            and not (ch == "\x1a" and number == len(lines) and line.strip("\x1a").strip() == "")
+        ]
         if controls:
             findings.append(Finding(Severity.ERROR, "FMT007", display, number, "Control character found in text record.", "Remove non-printing control characters.", controls[0] + 1))
     if not lines or not any(line.strip() for line in lines):
@@ -248,14 +251,14 @@ def parse_file(path: Path) -> ParsedFile:
             parsed.findings.append(Finding(Severity.ERROR, "STR003", str(path), number, "Data appears before a DSSAT title or section.", "Start the file with a '*' title line."))
         if current_table is None:
             # Narrative lines under GENERAL are valid; data-looking orphan lines are not.
-            if re.match(r"^[+\-.]?\d", stripped):
+            if parsed.kind != "species" and re.match(r"^[+\-.]?\d", stripped):
                 parsed.findings.append(Finding(Severity.WARNING, "STR004", str(path), number, "Numeric record has no active '@' header.", "Check for a missing or malformed header line."))
             continue
         tokens = _tokenize_data(raw, current_table.headers, current_table.starts)
         values = {header: tokens[i] if i < len(tokens) else None for i, header in enumerate(current_table.headers)}
         current_table.rows.append(Row(number, raw, values, tokens))
         missing_count = len(current_table.headers) - len(tokens)
-        if missing_count > 0:
+        if missing_count > 0 and parsed.kind != "species":
             missing_headers = current_table.headers[-missing_count:]
             # A final descriptive field is often optional; only flag missing non-text columns.
             non_text_missing = [h for h in missing_headers if not _looks_textual(h)]
@@ -281,9 +284,11 @@ def _looks_textual(header: str) -> bool:
 def _generic_checks(parsed: ParsedFile) -> None:
     display = str(parsed.path)
     first = next(((i, line.strip()) for i, line in enumerate(parsed.lines, 1) if line.strip() and not line.lstrip().startswith("!")), None)
-    if first and not first[1].startswith("*"):
+    if first and not first[1].startswith("*") and not (
+        parsed.kind in {"cultivar", "ecotype", "species"} and first[1].startswith("$")
+    ):
         parsed.findings.append(Finding(Severity.ERROR, "STR006", display, first[0], "First content line is not a DSSAT '*' title.", "Add the appropriate DSSAT title record."))
-    if not parsed.tables:
+    if not parsed.tables and parsed.kind != "species":
         parsed.findings.append(Finding(Severity.ERROR, "STR007", display, 1, "No '@' table headers found.", "Verify that this is a DSSAT input file and that header markers are intact."))
     for table in parsed.tables:
         for row in table.rows:
@@ -291,6 +296,8 @@ def _generic_checks(parsed: ParsedFile) -> None:
                 if value is None or is_missing(value):
                     continue
                 if DATE_FIELD.search(header) and header not in {"DAY", "DAYS"}:
+                    if str(value).strip().upper() == header:
+                        continue  # explicit template substitution token
                     if not dssat_date(value):
                         parsed.findings.append(Finding(Severity.ERROR, "DAT001", display, row.line, f"{header}='{value}' is not a valid YYDDD or YYYYDDD DSSAT date.", "Use a valid year and day-of-year, including leap-year rules."))
 
@@ -316,9 +323,16 @@ def _number_finding(
     severity: Severity = Severity.ERROR,
     code: str = "NUM001",
     message: str | None = None,
+    required: bool = False,
 ) -> float | None:
     value = row.values.get(field_name)
     if is_missing(value):
+        if required:
+            parsed.findings.append(Finding(
+                Severity.ERROR, "REQ001", str(parsed.path), row.line,
+                f"Required field {field_name} is missing.",
+                "Provide a valid value; -99 is not accepted for this required field.",
+            ))
         return None
     number = as_float(value)
     if number is None:
@@ -364,7 +378,13 @@ def validate_weather(parsed: ParsedFile) -> None:
     previous: date | None = None
     seen: set[date] = set()
     for row in table.rows:
-        parsed_date = dssat_date(row.values.get("DATE"))
+        raw_date = row.values.get("DATE")
+        parsed_date = dssat_date(raw_date)
+        if not parsed_date:
+            parsed.findings.append(Finding(
+                Severity.ERROR, "WTH020", display, row.line,
+                f"Required DATE value {raw_date!r} is missing or invalid.",
+            ))
         if parsed_date:
             if parsed_date in seen:
                 parsed.findings.append(Finding(Severity.ERROR, "WTH011", display, row.line, f"Duplicate weather date {row.values.get('DATE')}.", "Keep one daily record per station and date."))
@@ -375,11 +395,11 @@ def validate_weather(parsed: ParsedFile) -> None:
                 parsed.findings.append(Finding(Severity.WARNING, "WTH013", display, row.line, f"Gap of {missing_days} day(s) before weather date {row.values.get('DATE')}.", "Fill or deliberately account for missing daily weather records."))
             seen.add(parsed_date)
             previous = parsed_date
-        tmax = _number_finding(parsed, row, "TMAX", minimum=-70, maximum=65, severity=Severity.WARNING, code="WTH014")
-        tmin = _number_finding(parsed, row, "TMIN", minimum=-90, maximum=55, severity=Severity.WARNING, code="WTH015")
-        rain = _number_finding(parsed, row, "RAIN", minimum=0, maximum=1000, code="WTH016")
+        tmax = _number_finding(parsed, row, "TMAX", minimum=-70, maximum=65, severity=Severity.WARNING, code="WTH014", required=True)
+        tmin = _number_finding(parsed, row, "TMIN", minimum=-90, maximum=55, severity=Severity.WARNING, code="WTH015", required=True)
+        rain = _number_finding(parsed, row, "RAIN", minimum=0, maximum=1000, code="WTH016", required=True)
         if "SRAD" in row.values:
-            _number_finding(parsed, row, "SRAD", minimum=0, maximum=50, severity=Severity.WARNING, code="WTH017")
+            _number_finding(parsed, row, "SRAD", minimum=0, maximum=50, severity=Severity.WARNING, code="WTH017", required=True)
         if tmax is not None and tmin is not None and tmin > tmax:
             parsed.findings.append(Finding(Severity.ERROR, "WTH018", display, row.line, f"TMIN ({tmin:g}) exceeds TMAX ({tmax:g}).", "Swap or correct the temperature values."))
         if rain is not None and rain > 500:
@@ -419,10 +439,10 @@ def validate_soil(parsed: ParsedFile) -> None:
         if not table.rows:
             parsed.findings.append(Finding(Severity.ERROR, "SOL004", display, table.header_line, "Soil layer header has no layer records."))
         for row in table.rows:
-            depth = _number_finding(parsed, row, "SLB", minimum=0.01, maximum=1000, code="SOL005")
-            lll = _number_finding(parsed, row, "SLLL", minimum=0, maximum=1, code="SOL006")
-            dul = _number_finding(parsed, row, "SDUL", minimum=0, maximum=1, code="SOL007")
-            sat = _number_finding(parsed, row, "SSAT", minimum=0, maximum=1, code="SOL008")
+            depth = _number_finding(parsed, row, "SLB", minimum=0.01, maximum=1000, code="SOL005", required=True)
+            lll = _number_finding(parsed, row, "SLLL", minimum=0, maximum=1, code="SOL006", required=True)
+            dul = _number_finding(parsed, row, "SDUL", minimum=0, maximum=1, code="SOL007", required=True)
+            sat = _number_finding(parsed, row, "SSAT", minimum=0, maximum=1, code="SOL008", required=True)
             if depth is not None:
                 if depth in seen_depths:
                     parsed.findings.append(Finding(Severity.ERROR, "SOL009", display, row.line, f"Duplicate soil layer bottom depth SLB={depth:g} cm."))
@@ -448,6 +468,23 @@ def validate_soil(parsed: ParsedFile) -> None:
 
 def validate_genotype(parsed: ParsedFile) -> None:
     display = str(parsed.path)
+    if parsed.kind == "species":
+        has_title = any(
+            "SPECIES" in line.upper()
+            for line in parsed.lines[:5]
+            if line.strip().startswith(("*", "$"))
+        )
+        coefficient_records = [
+            line for line in parsed.lines
+            if line.strip() and not line.lstrip().startswith(("!", "*", "$", "@"))
+            and re.search(r"[-+]?\d+(?:\.\d+)?", line)
+        ]
+        if not has_title or not coefficient_records:
+            parsed.findings.append(Finding(
+                Severity.ERROR, "GEN001", display, 1,
+                "Legacy species file needs a *SPECIES title and coefficient records.",
+            ))
+        return
     expected = {"cultivar": {"VAR#"}, "ecotype": {"ECO#"}, "species": set()}[parsed.kind]
     candidate_tables = [t for t in parsed.tables if (not expected or expected.issubset(set(t.headers)))]
     if not candidate_tables:
@@ -471,7 +508,7 @@ def validate_genotype(parsed: ParsedFile) -> None:
             if parsed.kind == "cultivar" and "ECO#" in row.values and not is_missing(row.values.get("ECO#")):
                 ecotype_refs.add((row.line, str(row.values["ECO#"]).upper()))
             for header, value in row.values.items():
-                if header in {key, "VRNAME", "ECO#", "EXPNO"} or is_missing(value):
+                if header in {key, "VRNAME", "ECO#", "EXPNO", "EXP#"} or is_missing(value):
                     continue
                 # Coefficient tables are overwhelmingly numeric after identity columns.
                 if as_float(value) is None and not _looks_textual(header):
@@ -505,20 +542,33 @@ def validate_experiment(parsed: ParsedFile) -> None:
     if not treatments:
         parsed.findings.append(Finding(Severity.ERROR, "EXP002", display, 1, "No TREATMENTS table with N and TNAME was found."))
     else:
-        seen: set[str] = set()
+        seen: set[tuple[str, ...]] = set()
         section_ids = _experiment_section_ids(parsed)
         for row in treatments[0].rows:
             treatment = row.values.get("N")
             if is_missing(treatment):
                 parsed.findings.append(Finding(Severity.ERROR, "EXP003", display, row.line, "Treatment number N is missing."))
-            elif str(treatment) in seen:
-                parsed.findings.append(Finding(Severity.ERROR, "EXP004", display, row.line, f"Duplicate treatment number {treatment}."))
             else:
-                seen.add(str(treatment))
+                key = (
+                    tuple(str(row.values.get(name) or "") for name in ("N", "R", "O", "C"))
+                    if parsed.path.suffix.upper() == ".SQX"
+                    else (str(treatment),)
+                )
+                if key in seen:
+                    parsed.findings.append(Finding(Severity.ERROR, "EXP004", display, row.line, f"Duplicate treatment identity {key}."))
+                seen.add(key)
             for factor, section_hint in SECTION_BY_FACTOR.items():
+                if factor not in row.values:
+                    continue
                 value = row.values.get(factor)
                 number = as_float(value)
-                if number is None or number <= 0:
+                if is_missing(value):
+                    parsed.findings.append(Finding(Severity.ERROR, "EXP012", display, row.line, f"Required treatment factor {factor} is missing."))
+                    continue
+                if number is None or not float(number).is_integer() or number < 0:
+                    parsed.findings.append(Finding(Severity.ERROR, "EXP013", display, row.line, f"Treatment factor {factor}='{value}' must be a non-negative integer."))
+                    continue
+                if number == 0:
                     continue
                 integer = str(int(number))
                 available = section_ids.get(factor, set())
@@ -530,11 +580,13 @@ def validate_experiment(parsed: ParsedFile) -> None:
     planting_dates = _collect_dates(parsed, {"PDATE"})
     harvest_dates = _collect_dates(parsed, {"HDATE"})
     simulation_dates = _collect_dates(parsed, {"SDATE"})
-    if planting_dates and harvest_dates:
-        earliest_plant = min(value for _, value in planting_dates)
-        for line, harvest in harvest_dates:
-            if harvest < earliest_plant:
-                parsed.findings.append(Finding(Severity.ERROR, "EXP007", display, line, "Harvest date occurs before the earliest planting date."))
+    for table in parsed.tables:
+        if {"PDATE", "HDATE"}.issubset(table.headers):
+            for row in table.rows:
+                plant = dssat_date(row.values.get("PDATE"))
+                harvest = dssat_date(row.values.get("HDATE"))
+                if plant and harvest and harvest < plant:
+                    parsed.findings.append(Finding(Severity.ERROR, "EXP007", display, row.line, "Harvest date occurs before planting date in the same management record."))
     if planting_dates and simulation_dates:
         earliest_plant = min(value for _, value in planting_dates)
         for line, start in simulation_dates:
@@ -554,12 +606,14 @@ def validate_experiment(parsed: ParsedFile) -> None:
         for table in fields
         for row in table.rows
         if not is_missing(row.values.get("WSTA"))
+        and str(row.values.get("WSTA")).upper() not in {"00000000", "WSTA", "WID00000"}
     }
     parsed.metadata["soil_refs"] = {
         (row.line, str(row.values["ID_SOIL"]).upper())
         for table in fields
         for row in table.rows
         if not is_missing(row.values.get("ID_SOIL"))
+        and str(row.values.get("ID_SOIL")).upper() not in {"SOIL_ID", "ID_SOIL", "SID00000"}
     }
 
     _check_management_amounts(parsed)
@@ -634,22 +688,25 @@ def cross_file_checks(files: Sequence[ParsedFile]) -> list[Finding]:
 
     for parsed in files:
         if parsed.kind == "experiment":
-            if stations:
-                for line, ref in parsed.metadata.get("weather_refs", set()):
+            weather_refs = parsed.metadata.get("weather_refs", set())
+            if weather_refs:
+                for line, ref in weather_refs:
                     # WSTA may include a year suffix while INSI is the station base.
-                    if not any(ref == station or ref.startswith(station) or station.startswith(ref) for station in stations):
+                    if not stations or not any(ref == station or ref.startswith(station) or station.startswith(ref) for station in stations):
                         findings.append(Finding(Severity.ERROR, "REF001", str(parsed.path), line, f"Weather station '{ref}' was not found among scanned .WTH files."))
-            if soils:
-                for line, ref in parsed.metadata.get("soil_refs", set()):
+            soil_refs = parsed.metadata.get("soil_refs", set())
+            if soil_refs:
+                for line, ref in soil_refs:
                     if ref not in soils:
                         findings.append(Finding(Severity.ERROR, "REF002", str(parsed.path), line, f"Soil profile '{ref}' was not found among scanned .SOL files."))
-            if cultivars:
-                for line, ref in parsed.metadata.get("cultivar_refs", set()):
+            cultivar_refs = parsed.metadata.get("cultivar_refs", set())
+            if cultivar_refs:
+                for line, ref in cultivar_refs:
                     if ref not in cultivars:
                         findings.append(Finding(Severity.ERROR, "REF003", str(parsed.path), line, f"Cultivar '{ref}' was not found among scanned .CUL files."))
-        if parsed.kind == "cultivar" and ecotypes:
+        if parsed.kind == "cultivar":
             for line, ref in parsed.metadata.get("ecotype_refs", set()):
-                if ref not in ecotypes:
+                if not ecotypes or ref not in ecotypes:
                     findings.append(Finding(Severity.ERROR, "REF004", str(parsed.path), line, f"Ecotype '{ref}' was not found among scanned .ECO files."))
     return findings
 

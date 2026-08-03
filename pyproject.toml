@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dssat-file-checker"
-version = "0.1.0"
-description = "Static formatting, logic validator, and web GUI auto-healer for DSSAT crop-model input files"
+version = "0.2.0"
+description = "Read-only static validator for DSSAT crop-model input files"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
